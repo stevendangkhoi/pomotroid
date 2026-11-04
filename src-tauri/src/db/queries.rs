@@ -37,6 +37,20 @@ pub fn complete_session(
     Ok(())
 }
 
+/// Updates the recorded duration when the active round adopts a new setting.
+pub fn update_session_duration(
+    conn: &Connection,
+    session_id: i64,
+    duration_secs: u32,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET duration_secs = ?1 WHERE id = ?2",
+        params![duration_secs, session_id],
+    )?;
+    log::debug!("[db] session duration updated: id={session_id} duration={duration_secs}s");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Stats queries
 // ---------------------------------------------------------------------------
@@ -323,6 +337,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(completed, 1);
+    }
+
+    #[test]
+    fn updated_session_duration_is_used_in_stats() {
+        let conn = setup();
+        let id = insert_session(&conn, "work", 1500).unwrap();
+
+        update_session_duration(&conn, id, 300).unwrap();
+        complete_session(&conn, id, true).unwrap();
+
+        let stats = get_all_time_stats(&conn).unwrap();
+        assert_eq!(stats.total_work_secs, 300);
     }
 
     #[test]
