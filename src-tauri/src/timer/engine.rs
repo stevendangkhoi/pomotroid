@@ -26,6 +26,8 @@ pub enum TimerCommand {
     /// Update the stored duration without altering phase or elapsed time.
     /// Used to arm the next round/reset path without clobbering a fresh Start.
     Prime { duration_secs: u32 },
+    /// Apply a duration change to the current paused round.
+    UpdatePausedDuration { duration_secs: u32, restart: bool },
     /// OS sleep detected: freeze elapsed position, block until WakeResume.
     Suspend,
     /// OS wake detected: resume from the saved elapsed position.
@@ -40,6 +42,7 @@ pub enum TimerEvent {
     Complete { skipped: bool },
     Paused { elapsed_secs: u32 },
     Resumed { elapsed_secs: u32 },
+    DurationChanged { duration_secs: u32 },
     Reset,
     Suspended { elapsed_secs: u32 },
 }
@@ -178,6 +181,16 @@ fn run_loop(
                     // on the next Resume tick.
                     total_secs = d.max(elapsed_secs.saturating_add(1));
                     Transition::Stay
+                }
+                Ok(TimerCommand::UpdatePausedDuration { duration_secs, restart }) => {
+                    total_secs = duration_secs;
+                    let _ = event_tx.send(TimerEvent::DurationChanged { duration_secs });
+                    if restart {
+                        elapsed_secs = 0;
+                        Transition::To(Phase::Idle)
+                    } else {
+                        Transition::Stay
+                    }
                 }
                 Ok(TimerCommand::Shutdown) | Err(_) => Transition::Break,
                 _ => Transition::Stay,
