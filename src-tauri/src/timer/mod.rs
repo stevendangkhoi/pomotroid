@@ -118,6 +118,29 @@ impl TimerController {
         }
     }
 
+    #[cfg(test)]
+    fn new_for_test(
+        settings: Settings,
+        tick_interval: Duration,
+    ) -> (Self, std::sync::mpsc::Receiver<TimerEvent>) {
+        let sequence = SequenceState::new(settings.long_break_interval);
+        let duration = sequence.current_duration_secs(&settings);
+        let (engine, event_rx) = engine::spawn(duration, tick_interval);
+        (
+            Self {
+                engine,
+                sequence: Arc::new(Mutex::new(sequence)),
+                settings: Arc::new(Mutex::new(settings)),
+                shared: Arc::new(Mutex::new(TimerShared {
+                    elapsed_secs: 0,
+                    is_running: false,
+                })),
+                tray: TrayState::new(),
+            },
+            event_rx,
+        )
+    }
+
     // --- Commands ---
 
     /// Toggle: start a fresh timer if idle, resume if paused, pause if running.
@@ -196,24 +219,48 @@ impl TimerController {
         }
     }
 
-    /// Apply new settings values. Updates the in-memory copy and, if the
-    /// timer is idle (not running and no elapsed progress), reconfigures the
-    /// engine so the next Start uses the new duration.
-    ///
-    /// When the timer is running or paused, the current countdown is left
-    /// untouched; the new duration takes effect at the start of the next
-    /// round or after a manual reset.  Sending Reconfigure to a running
-    /// engine transitions it to Idle, which would freeze the timer.
+    /// Apply new settings values. A paused round adopts a changed duration
+    /// immediately; if elapsed time no longer fits, restart that round.
+    /// Running countdowns are left untouched because Reconfigure would stop
+    /// the engine.
     pub fn apply_settings(&self, new: Settings) {
         // Sync work_rounds_total so the round counter and advance() logic both
         // reflect the new long_break_interval immediately.
-        self.sequence.lock().unwrap().work_rounds_total = new.long_break_interval;
-        *self.settings.lock().unwrap() = new;
-        let s = self.shared.lock().unwrap();
-        let is_idle = !s.is_running && s.elapsed_secs == 0;
-        drop(s);
-        if is_idle {
-            self.reconfigure();
+        let update_command = {
+            let mut sequence = self.sequence.lock().unwrap();
+            let mut settings = self.settings.lock().unwrap();
+            let mut shared = self.shared.lock().unwrap();
+
+            sequence.work_rounds_total = new.long_break_interval;
+            let old_duration = sequence.current_duration_secs(&settings);
+            *settings = new;
+            let duration = sequence.current_duration_secs(&settings);
+            let duration_changed = duration != old_duration;
+            if shared.is_running {
+                None
+            } else if shared.elapsed_secs > 0 && duration_changed {
+                if shared.elapsed_secs >= duration {
+                    shared.elapsed_secs = 0;
+                    Some(TimerCommand::UpdatePausedDuration {
+                        duration_secs: duration,
+                        restart: true,
+                    })
+                } else {
+                    Some(TimerCommand::UpdatePausedDuration {
+                        duration_secs: duration,
+                        restart: false,
+                    })
+                }
+            } else if shared.elapsed_secs == 0 {
+                Some(TimerCommand::Reconfigure {
+                    duration_secs: duration,
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(command) = update_command {
+            self.engine.send(command);
         }
     }
 }
@@ -246,6 +293,20 @@ fn listen_events(
         match event {
             TimerEvent::Started { total_secs } => {
                 log::info!("[timer] started total={total_secs}s");
+                // A restarted round may have been edited again while idle.
+                // Record the duration the engine actually starts with.
+                if let Some(session_id) = current_session_id {
+                    match db.lock() {
+                        Ok(conn) => {
+                            if let Err(e) =
+                                queries::update_session_duration(&conn, session_id, total_secs)
+                            {
+                                log::error!("[timer] failed to update session duration: {e}");
+                            }
+                        }
+                        Err(e) => log::error!("[timer] failed to access session database: {e}"),
+                    }
+                }
                 shared.lock().unwrap().is_running = true;
                 let _ = app.emit("timer:started", serde_json::json!({ "total_secs": total_secs }));
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
@@ -439,6 +500,25 @@ fn listen_events(
                 tray::update_menu_items(&tray, true, false);
             }
 
+            TimerEvent::DurationChanged { duration_secs } => {
+                if let Some(session_id) = current_session_id {
+                    match db.lock() {
+                        Ok(conn) => {
+                            if let Err(e) =
+                                queries::update_session_duration(&conn, session_id, duration_secs)
+                            {
+                                log::error!(
+                                    "[timer] failed to update session duration: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("[timer] failed to access session database: {e}");
+                        }
+                    }
+                }
+            }
+
             TimerEvent::Reset => {
                 log::debug!("[timer] idle");
                 // Abandon the active session (leave DB row as-is).
@@ -515,5 +595,120 @@ fn build_snapshot(
         work_round_number: seq.work_round_number,
         work_rounds_total: seq.work_rounds_total,
         session_work_count: seq.session_work_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TICK: Duration = Duration::from_millis(10);
+
+    fn settings(work_secs: u32) -> Settings {
+        Settings {
+            time_work_secs: work_secs,
+            ..Settings::default()
+        }
+    }
+
+    fn pause_after(
+        timer: &TimerController,
+        events: &std::sync::mpsc::Receiver<TimerEvent>,
+        ticks: u32,
+    ) {
+        timer.engine.send(TimerCommand::Start);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(TimerEvent::Started { .. })
+        ));
+        timer.shared.lock().unwrap().is_running = true;
+
+        let mut elapsed = 0;
+        while elapsed < ticks {
+            if let TimerEvent::Tick { elapsed_secs, .. } =
+                events.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                elapsed = elapsed_secs;
+            }
+        }
+
+        timer.engine.send(TimerCommand::Pause);
+        loop {
+            if let TimerEvent::Paused { elapsed_secs } =
+                events.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                let mut shared = timer.shared.lock().unwrap();
+                shared.elapsed_secs = elapsed_secs;
+                shared.is_running = false;
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn shortening_paused_round_beyond_elapsed_restarts_with_new_duration() {
+        let (timer, events) = TimerController::new_for_test(settings(10), TICK);
+        pause_after(&timer, &events, 7);
+
+        timer.apply_settings(settings(5));
+
+        let snapshot = timer.get_snapshot();
+        assert_eq!(snapshot.elapsed_secs, 0);
+        assert_eq!(snapshot.total_secs, 5);
+        assert!(!snapshot.is_paused);
+
+        timer.toggle();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(TimerEvent::DurationChanged { duration_secs: 5 })
+        ));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(TimerEvent::Started { total_secs: 5 })
+        ));
+
+        let mut ticks = 0;
+        loop {
+            match events.recv_timeout(Duration::from_secs(1)).unwrap() {
+                TimerEvent::Tick { total_secs, .. } => {
+                    assert_eq!(total_secs, 5);
+                    ticks += 1;
+                }
+                TimerEvent::Complete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(ticks, 5);
+    }
+
+    #[test]
+    fn extending_paused_round_preserves_elapsed_and_resumes() {
+        let (timer, events) = TimerController::new_for_test(settings(10), TICK);
+        pause_after(&timer, &events, 3);
+
+        timer.apply_settings(settings(15));
+
+        let snapshot = timer.get_snapshot();
+        let paused_elapsed = snapshot.elapsed_secs;
+        assert!(paused_elapsed >= 3);
+        assert_eq!(snapshot.total_secs, 15);
+        assert!(snapshot.is_paused);
+
+        timer.toggle();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(TimerEvent::DurationChanged { duration_secs: 15 })
+        ));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(TimerEvent::Resumed { elapsed_secs }) if elapsed_secs == paused_elapsed
+        ));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(TimerEvent::Tick {
+                elapsed_secs,
+                total_secs: 15
+            }) if elapsed_secs == paused_elapsed + 1
+        ));
     }
 }
